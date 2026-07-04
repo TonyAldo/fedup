@@ -54,7 +54,7 @@ fedup --help              usage summary
 An interactive checklist built from `dnf check-update`: arrow keys to move, **space** to toggle, **a**/**n** for all/none of the visible list, **/** to filter by name substring, **c** to read a package's changelog or advisory before committing, **p** to pin the package via versionlock so it stops appearing in future update sets.
 
 ### 🛡️ Security-only updates
-Shows the advisory severity summary and per-CVE list, then applies only `dnf upgrade --security`. Also available non-interactively as `fedup --security`.
+Shows the advisory severity summary and per-CVE list, then applies only `dnf upgrade --security`. Available from the menu or as `fedup --security` — both paths require confirmation before anything is installed.
 
 ### 📸 Snapshots before every update
 On Btrfs roots, every update action takes a snapshot first. Prefers **snapper** (with linked pre/post snapshot pairs, so `snapper status` shows exactly what a transaction changed); offers to install and configure it if missing; falls back to a raw read-only `btrfs subvolume snapshot`. Skips gracefully on non-Btrfs filesystems.
