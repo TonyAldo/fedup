@@ -4,13 +4,13 @@
       ▐▛███▜▌
      ▟██████▙     f e d u p
     ▐████████▌    ─────────────────────────────
-     ▜██████▛     Fedora Update Utility · KDE Edition
+     ▜██████▛     Fedora Update Utility
       ▘▘ ▝▝
 ```
 
 **The everything-updater for Fedora.** A single-file bash TUI that unifies every update path on a Fedora system — dnf, Flatpak, Snap, device firmware, and containers — with pre-update Btrfs snapshots, per-package selection, security-only mode, scheduled checks, and remote multi-host support.
 
-Built for Fedora 44 KDE. Zero dependencies beyond a stock install — anything optional (snapper, versionlock plugin, snapd…) is detected at runtime and offered for installation when you first use the feature.
+Built for Fedora. Zero dependencies beyond a stock install — anything optional (snapper, versionlock plugin, snapd…) is detected at runtime and offered for installation when you first use the feature.
 
 ## Why
 
@@ -20,7 +20,7 @@ Fedora spreads updates across half a dozen tools: `dnf` for packages, `flatpak` 
 
 ```bash
 git clone git@github.com:TonyAldo/fedup.git
-cd Fedup
+cd fedup
 chmod +x fedup.sh
 ./fedup.sh
 ```
@@ -99,7 +99,7 @@ AUTOREMOVE=true         # dnf autoremove at end of 'update everything'
 
 The menu's timer installer sets up either or both:
 
-- **Daily check (user timer)** — runs `fedup --check --notify`; you get a Plasma notification when updates are pending. Copies the script to `~/.local/bin/fedup`.
+- **Daily check (user timer)** — runs `fedup --check --notify`; you get a desktop notification when updates are pending. Copies the script to `~/.local/bin/fedup`.
 - **Weekly auto-update (system timer)** — runs `fedup --all` unattended, Sundays ~4 AM. Copies the script to `/usr/local/bin/fedup`.
 
 ```bash
@@ -124,7 +124,7 @@ Requires SSH key auth to each host. `--json` output is a valid JSON array with p
 
 ## Requirements
 
-- Fedora Workstation/KDE (developed against Fedora 44, dnf5)
+- Fedora (developed against Fedora 44, dnf5)
 - bash 4+, plus base-system tools (dnf, sudo, curl, findmnt, systemctl — all preinstalled)
 - Optional, offered on demand: `snapper`, `dnf5-plugins` (versionlock/changelog/needs-restarting), `snapd`, `fwupd`, `distrobox`
 
