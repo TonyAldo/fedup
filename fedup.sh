@@ -24,9 +24,11 @@
 #
 set -o pipefail
 
-VERSION="2.1"
+VERSION="2.2"
 HIST_DIR="$HOME/.local/share/fedup/history"
 mkdir -p "$HIST_DIR" 2>/dev/null
+# Temp files created during a run (spinner logs, etc.) — cleaned on EXIT
+FEDUP_TMPFILES=()
 
 # ─────────────────────────── Config file ──────────────────────────────
 CONFIG_FILE="$HOME/.config/fedup/config"
@@ -117,7 +119,10 @@ EOF
 spinner() {  # spinner "message" -- command...
     local msg="$1"; shift
     local frames='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏' i=0
-    "$@" &> /tmp/fedup_spin.log &
+    local spinlog
+    spinlog=$(mktemp "${TMPDIR:-/tmp}/fedup_spin.XXXXXX") || spinlog=$(mktemp)
+    FEDUP_TMPFILES+=("$spinlog")
+    "$@" &> "$spinlog" &
     local pid=$!
     tput civis 2>/dev/null
     while kill -0 "$pid" 2>/dev/null; do
@@ -130,8 +135,9 @@ spinner() {  # spinner "message" -- command...
         printf "\r  ${OK}  %s   \n" "$msg"
     else
         printf "\r  ${ERR}  %s   \n" "$msg"
-        scrub_progress < /tmp/fedup_spin.log | tail -n 6 | sed 's/^/     /'
+        scrub_progress < "$spinlog" | tail -n 6 | sed 's/^/     /'
     fi
+    rm -f "$spinlog"
     return $rc
 }
 
@@ -156,7 +162,11 @@ need_sudo() {
     fi
 }
 
-cleanup() { [[ -n "$SUDO_KEEPALIVE" ]] && kill "$SUDO_KEEPALIVE" 2>/dev/null; tput cnorm 2>/dev/null; }
+cleanup() {
+    [[ -n "$SUDO_KEEPALIVE" ]] && kill "$SUDO_KEEPALIVE" 2>/dev/null
+    local f; for f in "${FEDUP_TMPFILES[@]+"${FEDUP_TMPFILES[@]}"}"; do rm -f "$f"; done
+    tput cnorm 2>/dev/null
+}
 trap cleanup EXIT
 
 notify() {  # notify "title" "body" [icon]
@@ -165,6 +175,38 @@ notify() {  # notify "title" "body" [icon]
 }
 
 is_dnf5() { dnf --version 2>/dev/null | grep -qi 'dnf5'; }
+
+# Run a command with sudo only when actually mutating (not dry-run, not already root).
+# Dry-run previews use plain dnf --assumeno and need no privilege.
+priv() {
+    if $DRY_RUN || (( EUID == 0 )); then
+        "$@"
+    else
+        sudo "$@"
+    fi
+}
+
+# dnf needs-restarting: exit 1 = action recommended, 0 = clean, other = unavailable.
+# dnf5 treats -r/--reboothint as a no-op (bare command == dnf4's -r).
+reboot_needed() {
+    dnf needs-restarting -r &>/dev/null
+    (( $? == 1 ))
+}
+
+# List services holding stale libs (dnf4 --services / dnf5 -s|--services).
+# Note: needs-restarting exits 1 when services need a restart — that is success for us.
+dnf_stale_services() {
+    local out=""
+    out=$(priv dnf needs-restarting --services 2>/dev/null) || true
+    [[ -z "$out" ]] && { out=$(priv dnf needs-restarting -s 2>/dev/null) || true; }
+    printf '%s\n' "$out" | grep -E '\.service' || true
+}
+
+# Last dnf transaction details for history reports.
+dnf_history_last() {
+    priv dnf history info last 2>/dev/null \
+        || priv dnf history info 2>/dev/null | head -n 80
+}
 
 # ───────────────────────── History / reporting ────────────────────────
 RUN_LOG=""
@@ -190,10 +232,14 @@ scrub_progress() {  # filter stdin: drop progress spam, strip ANSI, dedupe
 
 log_cmd() {  # run command once: compact in-place progress on screen, clean log on disk
     local line rc
+    local -a pstat
+    # Capture the real command status (stage 0). Temporarily clear pipefail so a
+    # failing filter/read loop cannot mask or replace the command's exit code.
+    set +o pipefail
     "$@" 2>&1 \
     | tr '\r' '\n' \
     | sed -u 's/\x1b\[[0-9;]*[a-zA-Z]//g' \
-    | while IFS= read -r line; do
+    | while IFS= read -r line || [[ -n "$line" ]]; do
         if [[ "$line" =~ $PROGRESS_RE ]]; then
             printf '\r\033[K  %b  %s %s' \
                 "${FG_CYAN}⇣${RESET}" "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]:-…}"
@@ -202,13 +248,15 @@ log_cmd() {  # run command once: compact in-place progress on screen, clean log 
             log_line "  $line"
         fi
       done
-    rc=${PIPESTATUS[0]}
+    pstat=("${PIPESTATUS[@]}")
+    set -o pipefail
+    rc=${pstat[0]:-1}
     printf '\r\033[K'
     return "$rc"
 }
 log_dnf_tx() {  # append last dnf transaction details
     [[ -n "$RUN_LOG" ]] || return 0
-    { echo; echo "── dnf transaction ──"; sudo dnf history info last 2>/dev/null; } >> "$RUN_LOG"
+    { echo; echo "── dnf transaction ──"; dnf_history_last; } >> "$RUN_LOG"
 }
 log_finish() {
     [[ -n "$RUN_LOG" ]] || return 0
@@ -217,8 +265,6 @@ log_finish() {
     info "Report saved: ${FG_GRAY}${RUN_LOG/#$HOME/\~}${RESET}"
     RUN_LOG=""
 }
-
-reboot_needed() { ! dnf needs-restarting -r &>/dev/null; }
 
 # ───────────────────────── Btrfs snapshots ────────────────────────────
 snapshot_pre_update() {  # returns 0 if snapshot made or declined-but-safe to continue
@@ -293,8 +339,15 @@ ensure_versionlock() {
     dnf versionlock list &>/dev/null && return 0
     warn "versionlock plugin not available."
     if confirm "Install dnf versionlock plugin?"; then
-        if is_dnf5; then sudo dnf install -y dnf5-plugins
-        else sudo dnf install -y python3-dnf-plugin-versionlock; fi
+        need_sudo || return 1
+        # dnf5: versionlock ships in dnf5-plugins; dnf4: dedicated python plugin
+        if is_dnf5; then
+            sudo dnf install -y dnf5-plugins \
+                || sudo dnf install -y python3-dnf5-plugin-versionlock 2>/dev/null
+        else
+            sudo dnf install -y python3-dnf-plugin-versionlock \
+                || sudo dnf install -y 'dnf-plugins-core' 2>/dev/null
+        fi
         dnf versionlock list &>/dev/null
     else
         return 1
@@ -328,17 +381,28 @@ do_versionlock() {
 # ──────────────────────── Security-only updates ───────────────────────
 do_security() {
     title "Security updates"
-    guard_atomic || return
-    need_sudo || return
-    spinner "Checking security advisories" sudo dnf -q --refresh updateinfo summary --updates
+    guard_atomic || return 1
+    # Dry-run previews need no sudo (dnf --assumeno is unprivileged).
+    if ! $DRY_RUN; then
+        need_sudo || return 1
+    fi
+    if $DRY_RUN; then
+        spinner "Checking security advisories" dnf -q --refresh updateinfo summary --updates \
+            || spinner "Checking security advisories" dnf -q --refresh advisory summary
+    else
+        spinner "Checking security advisories" sudo dnf -q --refresh updateinfo summary --updates \
+            || spinner "Checking security advisories" sudo dnf -q --refresh advisory summary
+    fi
     echo "  ── advisory summary ──"
-    dnf -q updateinfo summary --updates 2>/dev/null | sed 's/^/     /'
+    dnf -q updateinfo summary --updates 2>/dev/null | sed 's/^/     /' \
+        || dnf -q advisory summary 2>/dev/null | sed 's/^/     /'
     echo
     local seclist
     seclist=$(dnf -q updateinfo list --updates --security 2>/dev/null | tail -n +2)
+    [[ -z "$seclist" ]] && seclist=$(dnf -q advisory list --security --available 2>/dev/null | tail -n +2)
     if [[ -z "$seclist" ]]; then
         good "No pending security updates. 🎉"
-        return
+        return 0
     fi
     info "Pending security updates:"
     printf '%s\n' "$seclist" | awk '{sev=$2; adv=$1; pkg=$3;
@@ -347,16 +411,18 @@ do_security() {
     (( n > 30 )) && printf "       ${FG_GRAY}…and %d more${RESET}\n" "$(( n - 30 ))"
     echo
     if $DRY_RUN; then
-        info "Dry-run — transaction preview only:"
-        sudo dnf upgrade --security --assumeno
-        return
+        info "Dry-run — transaction preview only (no sudo required):"
+        dnf upgrade --security --assumeno
+        return 0
     fi
     if confirm "Apply security updates only ($n advisories)?"; then
         log_start "security-updates"
         snapshot_pre_update
         sudo dnf upgrade --security -y && good "Security updates applied." || fail "dnf reported errors."
         log_dnf_tx; snapshot_post_update; log_finish
+        return 0
     fi
+    return 1  # user declined
 }
 
 # ────────────── DNF updates + interactive picker (v2) ─────────────────
@@ -364,7 +430,12 @@ declare -a PKG_NAME PKG_VER PKG_REPO PKG_SEL
 
 fetch_updates() {
     PKG_NAME=(); PKG_VER=(); PKG_REPO=(); PKG_SEL=()
-    spinner "Refreshing metadata & checking for updates" sudo dnf -q --refresh check-update
+    # Dry-run / unprivileged path can refresh without sudo when metadata is readable.
+    if $DRY_RUN || (( EUID == 0 )); then
+        spinner "Refreshing metadata & checking for updates" dnf -q --refresh check-update
+    else
+        spinner "Refreshing metadata & checking for updates" sudo dnf -q --refresh check-update
+    fi
     local rc=$?
     if (( rc == 0 )); then return 1; fi
     if (( rc != 100 )); then fail "dnf check-update failed (rc=$rc)"; return 2; fi
@@ -380,9 +451,13 @@ show_changelog() {  # show_changelog pkgname
     printf "\n  ${BOLD}${FG_CYAN}Changelog / advisory — %s${RESET}\n" "$1"
     hr
     {
-        dnf -q changelog --count 3 "$1" 2>/dev/null \
+        # dnf5 prefers --count=N; dnf4 accepts --count N. Fall through advisory/info.
+        dnf -q changelog --count=3 "$1" 2>/dev/null \
+        || dnf -q changelog --count 3 "$1" 2>/dev/null \
         || dnf -q updateinfo info "$1" 2>/dev/null \
-        || dnf -q repoquery --info "$1" 2>/dev/null
+        || dnf -q advisory info "$1" 2>/dev/null \
+        || dnf -q repoquery --info "$1" 2>/dev/null \
+        || dnf -q info "$1" 2>/dev/null
     } | head -40 | sed 's/^/   /'
     hr
     printf "  ${FG_GRAY}press any key to return…${RESET}"
@@ -418,12 +493,18 @@ pick_packages() {
         for v in $(seq "$start" "$end"); do
             (( total == 0 )) && break
             local i=${VIEW[v]}
-            local mark="${FG_GRAY}○${RESET}"
-            (( PKG_SEL[i] )) && mark="${FG_GREEN}●${RESET}"
-            local dot="○"; (( PKG_SEL[i] )) && dot="●"
+            # Consistent ●/○ glyph; selection row uses reverse-video so drop per-glyph color.
+            local mark on_mark
+            if (( PKG_SEL[i] )); then
+                mark="${FG_GREEN}●${RESET}"
+                on_mark="●"
+            else
+                mark="${FG_GRAY}○${RESET}"
+                on_mark="○"
+            fi
             if (( v == cur )); then
                 printf "  ${BG_SEL}${FG_WHITE} %s %-42.42s %-28.28s %-14.14s${RESET}\n" \
-                       "$dot" "${PKG_NAME[i]}" "${PKG_VER[i]}" "${PKG_REPO[i]}"
+                       "$on_mark" "${PKG_NAME[i]}" "${PKG_VER[i]}" "${PKG_REPO[i]}"
             else
                 printf "   %b %-42.42s ${FG_GRAY}%-28.28s %-14.14s${RESET}\n" \
                        "$mark" "${PKG_NAME[i]}" "${PKG_VER[i]}" "${PKG_REPO[i]}"
@@ -466,22 +547,24 @@ pick_packages() {
 
 do_dnf_selective() {
     title "System updates (dnf) — pick & choose"
-    guard_atomic || return
-    need_sudo || return
+    guard_atomic || return 1
+    if ! $DRY_RUN; then
+        need_sudo || return 1
+    fi
     fetch_updates
     case $? in
-        1) good "System is fully up to date — nothing to do."; return;;
-        2) return;;
+        1) good "System is fully up to date — nothing to do."; return 0;;
+        2) return 2;;
     esac
-    pick_packages || { warn "Selection cancelled."; return; }
+    pick_packages || { warn "Selection cancelled."; return 1; }
     local chosen=()
     for i in "${!PKG_NAME[@]}"; do (( PKG_SEL[i] )) && chosen+=("${PKG_NAME[i]}"); done
     clear; banner; title "Applying ${#chosen[@]} selected updates"
-    if (( ${#chosen[@]} == 0 )); then warn "Nothing selected."; return; fi
+    if (( ${#chosen[@]} == 0 )); then warn "Nothing selected."; return 1; fi
     if $DRY_RUN; then
-        info "Dry-run — transaction preview only:"
-        sudo dnf upgrade --assumeno "${chosen[@]}"
-        return
+        info "Dry-run — transaction preview only (no sudo required):"
+        dnf upgrade --assumeno "${chosen[@]}"
+        return 0
     fi
     log_start "selective-dnf"
     snapshot_pre_update
@@ -491,13 +574,13 @@ do_dnf_selective() {
 
 do_dnf_full() {
     title "Full system upgrade (dnf)"
-    guard_atomic || return
-    need_sudo || return
+    guard_atomic || return 1
     if $DRY_RUN; then
-        info "Dry-run — transaction preview only:"
-        sudo dnf upgrade --refresh --assumeno
-        return
+        info "Dry-run — transaction preview only (no sudo required):"
+        dnf upgrade --refresh --assumeno
+        return 0
     fi
+    need_sudo || return 1
     log_start "full-dnf"
     snapshot_pre_update
     sudo dnf upgrade --refresh -y && good "System packages updated." || fail "dnf upgrade reported errors."
@@ -646,18 +729,25 @@ do_firmware() {
 # ──────────────── Service restarts (avoid full reboots) ───────────────
 do_restarting() {
     title "Stale libraries — reboot or restart services?"
-    need_sudo || return
-    if dnf needs-restarting -r &>/dev/null; then
-        good "Core system is clean — no reboot required."
-    else
+    need_sudo || return 1
+    # dnf4/dnf5: exit 1 = reboot recommended; 0 = clean; other = plugin missing
+    if reboot_needed; then
         warn "Kernel or core libraries changed — a full reboot IS recommended."
+    else
+        dnf needs-restarting -r &>/dev/null
+        local nrc=$?
+        if (( nrc == 0 )); then
+            good "Core system is clean — no reboot required."
+        else
+            warn "needs-restarting unavailable (install dnf5-plugins / dnf-plugins-core) — cannot assess reboot."
+        fi
     fi
     echo
     local svcs
-    svcs=$(sudo dnf needs-restarting --services 2>/dev/null | grep -E '\.service' )
+    svcs=$(dnf_stale_services)
     if [[ -z "$svcs" ]]; then
         good "No running services are holding deleted/updated libraries."
-        return
+        return 0
     fi
     info "Services running with stale libraries:"
     printf '%s\n' "$svcs" | sed 's/^/       ↻ /'
@@ -670,7 +760,9 @@ do_restarting() {
                 || printf "       ${WARN} skipped   %s\n" "$s"
         done <<< "$svcs"
         good "Done — many reboots avoided this way."
+        return 0
     fi
+    return 1
 }
 
 # ───────────────── Distrobox / Toolbox containers ─────────────────────
@@ -724,8 +816,13 @@ do_copr_health() {
             printf "  ${OK}  %s\n" "$name"
         else
             printf "  ${ERR}  %s  ${FG_RED}← unreachable for Fedora %s (dead/abandoned COPR?)${RESET}\n" "$name" "$rel"
-            confirm "   Disable this repo?" && sudo dnf config-manager setopt "${name}.enabled=0" 2>/dev/null \
-                || sudo dnf config-manager --set-disabled "$name" 2>/dev/null
+            if confirm "   Disable this repo?"; then
+                # dnf5: config-manager disable / setopt; dnf4: --set-disabled
+                sudo dnf config-manager disable "$name" 2>/dev/null \
+                    || sudo dnf config-manager setopt "${name}.enabled=0" 2>/dev/null \
+                    || sudo dnf config-manager --set-disabled "$name" 2>/dev/null \
+                    && good "Disabled $name" || warn "Could not disable $name"
+            fi
         fi
     done
     info "Dead COPRs are the #1 cause of dnf errors after a Fedora version bump."
@@ -733,13 +830,22 @@ do_copr_health() {
 
 # ─────────────────────────── Check / counts ───────────────────────────
 count_updates() {  # sets CNT_DNF CNT_SEC CNT_FLATPAK CNT_SNAP CNT_FW REBOOT
+    # Honors SKIP_* config so --check / notifications match 'update everything'.
     CNT_DNF=0; CNT_SEC=0; CNT_FLATPAK=0; CNT_SNAP=0; CNT_FW=0; REBOOT=false
     dnf -q check-update --refresh &>/dev/null
     (( $? == 100 )) && CNT_DNF=$(dnf -q check-update 2>/dev/null | awk 'NF==3' | grep -vc '^Obsoleting' )
-    CNT_SEC=$(dnf -q updateinfo list --updates --security 2>/dev/null | tail -n +2 | wc -l)
-    command -v flatpak &>/dev/null && CNT_FLATPAK=$(flatpak remote-ls --updates 2>/dev/null | wc -l)
-    command -v snap &>/dev/null && CNT_SNAP=$(snap refresh --list 2>/dev/null | tail -n +2 | wc -l)
-    if command -v fwupdmgr &>/dev/null; then
+    local sec_out
+    sec_out=$(dnf -q updateinfo list --updates --security 2>/dev/null | tail -n +2)
+    # dnf5: updateinfo is an alias for advisory; keep both for older/plugin edge cases
+    [[ -z "$sec_out" ]] && sec_out=$(dnf -q advisory list --security --available 2>/dev/null | tail -n +2)
+    CNT_SEC=$(printf '%s\n' "$sec_out" | grep -c . || true)
+    if ! $SKIP_FLATPAK && command -v flatpak &>/dev/null; then
+        CNT_FLATPAK=$(flatpak remote-ls --updates 2>/dev/null | wc -l)
+    fi
+    if ! $SKIP_SNAP && command -v snap &>/dev/null; then
+        CNT_SNAP=$(snap refresh --list 2>/dev/null | tail -n +2 | wc -l)
+    fi
+    if ! $SKIP_FIRMWARE && command -v fwupdmgr &>/dev/null; then
         fwupdmgr get-updates &>/dev/null && CNT_FW=$(fwupdmgr get-updates 2>/dev/null | grep -c 'New version' )
     fi
     reboot_needed && REBOOT=true
@@ -839,20 +945,42 @@ EOF
 }
 
 # ───────────────────────────── Remote mode ────────────────────────────
+# Run fedup on a remote host, always removing the uploaded copy afterwards.
+_remote_ssh() {  # _remote_ssh host remote_path args...
+    local host="$1" rpath="$2"; shift 2
+    # trap cleans the script even if bash is killed mid-run
+    ssh -t "$host" "trap 'rm -f $(printf %q "$rpath")' EXIT; bash $(printf %q "$rpath") $(printf '%q ' "$@")"
+}
+
+_remote_ssh_capture() {  # same without -t; stdout captured by caller
+    local host="$1" rpath="$2"; shift 2
+    ssh "$host" "trap 'rm -f $(printf %q "$rpath")' EXIT; bash $(printf %q "$rpath") $(printf '%q ' "$@")"
+}
+
 do_remote() {  # do_remote all|check host1 host2...
     local mode="$1"; shift
     local self; self=$(readlink -f "$0")
     local failures=0 results=()
     for host in "$@"; do
         $JSON_OUT || title "Remote: $host"
-        if ! scp -q "$self" "$host:/tmp/fedup.sh" 2>/dev/null; then
+        # Unique path avoids clobbering concurrent runs; cleaned via remote trap.
+        local rpath="/tmp/fedup.$$.$RANDOM.sh"
+        if $DRY_RUN && [[ "$mode" != "check" ]]; then
+            printf "  \033[38;5;221m▷ dry-run:\033[0m scp %s %s:%s\n" "$self" "$host" "$rpath"
+            printf "  \033[38;5;221m▷ dry-run:\033[0m ssh %s 'bash %s --dry-run --all' (then rm)\n" "$host" "$rpath"
+            results+=("{\"host\":\"$host\",\"mode\":\"all\",\"ok\":true,\"dry_run\":true}")
+            continue
+        fi
+        if ! scp -q "$self" "$host:$rpath" 2>/dev/null; then
             $JSON_OUT && results+=("{\"host\":\"$host\",\"mode\":\"$mode\",\"ok\":false,\"error\":\"scp_failed\"}") \
                       || fail "$host — SSH/scp failed (check keys & connectivity)"
             (( failures++ )); continue
         fi
         if [[ "$mode" == "check" ]]; then
             local out rc
-            out=$(ssh "$host" "bash /tmp/fedup.sh --check --json" 2>/dev/null); rc=$?
+            out=$(_remote_ssh_capture "$host" "$rpath" --check --json 2>/dev/null); rc=$?
+            # If capture failed before trap, best-effort remote cleanup
+            (( rc != 0 && rc != 10 )) && ssh "$host" "rm -f $(printf %q "$rpath")" 2>/dev/null || true
             if [[ -n "$out" ]] && (( rc == 0 || rc == 10 )); then
                 $JSON_OUT && results+=("$out") || printf '%s\n' "$out"
             else
@@ -861,13 +989,11 @@ do_remote() {  # do_remote all|check host1 host2...
                 (( failures++ ))
             fi
         else
-            if $DRY_RUN; then
-                run ssh -t "$host" "bash /tmp/fedup.sh --all"
-                results+=("{\"host\":\"$host\",\"mode\":\"all\",\"ok\":true,\"dry_run\":true}")
-            elif ssh -t "$host" "bash /tmp/fedup.sh --all"; then
+            if _remote_ssh "$host" "$rpath" --all; then
                 $JSON_OUT && results+=("{\"host\":\"$host\",\"mode\":\"all\",\"ok\":true}") \
                           || good "$host — update complete"
             else
+                ssh "$host" "rm -f $(printf %q "$rpath")" 2>/dev/null || true
                 $JSON_OUT && results+=("{\"host\":\"$host\",\"mode\":\"all\",\"ok\":false}") \
                           || fail "$host — remote update reported errors"
                 (( failures++ ))
@@ -885,39 +1011,81 @@ do_remote() {  # do_remote all|check host1 host2...
 # ───────────────────────────── Everything ─────────────────────────────
 do_everything() {
     title "Update everything"
-    need_sudo || return
+    if ! $DRY_RUN; then
+        need_sudo || return 1
+    fi
     if $DRY_RUN; then
         info "Dry-run — this is what an 'update everything' run would do:"
         count_updates
         printf "     dnf: %d pkgs (%d security) · flatpak: %d · snap: %d · firmware: %d\n" \
                "$CNT_DNF" "$CNT_SEC" "$CNT_FLATPAK" "$CNT_SNAP" "$CNT_FW"
-        run sudo dnf upgrade --refresh -y
-        $SKIP_FLATPAK   || run flatpak update -y --noninteractive
-        $SKIP_SNAP      || run sudo snap refresh
-        $SKIP_FIRMWARE  || run fwupdmgr update -y --no-reboot-check
-        $SKIP_CONTAINERS|| run distrobox upgrade --all
-        $AUTOREMOVE     && run sudo dnf autoremove -y
-        return
+        if $IS_ATOMIC; then
+            run sudo rpm-ostree upgrade
+        else
+            run dnf upgrade --refresh --assumeno
+        fi
+        $SKIP_FLATPAK    || run flatpak update -y --noninteractive
+        $SKIP_SNAP       || run sudo snap refresh
+        $SKIP_FIRMWARE   || run fwupdmgr update -y --no-reboot-check
+        if ! $SKIP_CONTAINERS; then
+            command -v distrobox &>/dev/null && run distrobox upgrade --all
+            if command -v toolbox &>/dev/null; then
+                local tboxes t
+                tboxes=$(toolbox list -c 2>/dev/null | tail -n +2 | awk '{print $2}')
+                for t in $tboxes; do
+                    run toolbox run -c "$t" sudo dnf upgrade -y
+                done
+            fi
+        fi
+        ! $IS_ATOMIC && $AUTOREMOVE && run dnf autoremove --assumeno
+        return 0
     fi
     log_start "everything"
     snapshot_pre_update
+    local failures=0
     if $IS_ATOMIC; then
-        spinner "rpm-ostree: upgrading base image" sudo rpm-ostree upgrade
+        spinner "rpm-ostree: upgrading base image" sudo rpm-ostree upgrade || (( failures++ )) || true
     else
-        spinner "dnf: full system upgrade" sudo dnf upgrade --refresh -y
+        spinner "dnf: full system upgrade" sudo dnf upgrade --refresh -y || (( failures++ )) || true
         log_dnf_tx
     fi
-    ! $SKIP_FLATPAK && command -v flatpak &>/dev/null && spinner "flatpak: updating apps & runtimes" flatpak update -y --noninteractive
-    ! $SKIP_SNAP    && command -v snap    &>/dev/null && spinner "snap: refreshing" sudo snap refresh
-    if ! $SKIP_FIRMWARE && command -v fwupdmgr &>/dev/null; then
-        spinner "firmware: refreshing LVFS metadata" fwupdmgr refresh --force
-        fwupdmgr get-updates &>/dev/null && spinner "firmware: staging updates" fwupdmgr update -y --no-reboot-check
+    if ! $SKIP_FLATPAK && command -v flatpak &>/dev/null; then
+        spinner "flatpak: updating apps & runtimes" flatpak update -y --noninteractive || (( failures++ )) || true
     fi
-    ! $SKIP_CONTAINERS && command -v distrobox &>/dev/null && spinner "distrobox: upgrading containers" distrobox upgrade --all
-    ! $IS_ATOMIC && $AUTOREMOVE && spinner "dnf: cleaning old packages" sudo dnf autoremove -y
+    if ! $SKIP_SNAP && command -v snap &>/dev/null; then
+        spinner "snap: refreshing" sudo snap refresh || (( failures++ )) || true
+    fi
+    if ! $SKIP_FIRMWARE && command -v fwupdmgr &>/dev/null; then
+        spinner "firmware: refreshing LVFS metadata" fwupdmgr refresh --force || (( failures++ )) || true
+        if fwupdmgr get-updates &>/dev/null; then
+            spinner "firmware: staging updates" fwupdmgr update -y --no-reboot-check || (( failures++ )) || true
+        fi
+    fi
+    if ! $SKIP_CONTAINERS; then
+        if command -v distrobox &>/dev/null; then
+            spinner "distrobox: upgrading containers" distrobox upgrade --all || (( failures++ )) || true
+        fi
+        if command -v toolbox &>/dev/null; then
+            local tboxes t
+            tboxes=$(toolbox list -c 2>/dev/null | tail -n +2 | awk '{print $2}')
+            for t in $tboxes; do
+                [[ -z "$t" ]] && continue
+                spinner "toolbox: upgrading $t" toolbox run -c "$t" sudo dnf upgrade -y || (( failures++ )) || true
+            done
+        fi
+    fi
+    if ! $IS_ATOMIC && $AUTOREMOVE; then
+        spinner "dnf: cleaning old packages" sudo dnf autoremove -y || (( failures++ )) || true
+    fi
     snapshot_post_update
+    (( failures > 0 )) && log_line "failures: $failures"
     log_finish
     echo
+    if (( failures > 0 )); then
+        warn "Finished with $failures failed step(s) — check the log above / history report."
+        notify "fedup complete" "Finished with $failures error(s) — review the report" "dialog-warning"
+        return 1
+    fi
     if reboot_needed; then
         warn "All done — a reboot is recommended (kernel/core libs changed)."
         notify "fedup complete" "Updates applied — reboot recommended" "system-reboot"
@@ -925,6 +1093,7 @@ do_everything() {
         good "All done — no reboot required."
         notify "fedup complete" "All updates applied — no reboot needed"
     fi
+    return 0
 }
 
 # ───────────────────────────── History view ───────────────────────────
@@ -1067,8 +1236,10 @@ main_menu() {
             q) exit 0;;
             "")
                 clear; banner
-                "${MENU[$cur]%%|*}"
-                pause
+                local arc=0
+                "${MENU[$cur]%%|*}" || arc=$?
+                # return 1 = cancelled / declined / aborted early → skip extra Enter
+                (( arc == 1 )) || pause
                 ;;
         esac
     done
@@ -1090,17 +1261,21 @@ set -- "${ARGS[@]}"
 
 case "$1" in
     --all)
-        banner; need_sudo && do_everything;;
+        banner
+        do_everything
+        exit $?;;
     --security)
-        banner; do_security;;
+        banner
+        do_security
+        exit $?;;
     --check)
         $JSON_OUT || banner
         if $NOTIFY; then do_check notify; else do_check; fi
         exit $?;;
     --remote)
-        shift; do_remote all "$@";;
+        shift; do_remote all "$@"; exit $?;;
     --remote-check)
-        shift; do_remote check "$@";;
+        shift; do_remote check "$@"; exit $?;;
     --version)
         echo "fedup v$VERSION";;
     --help|-h)
