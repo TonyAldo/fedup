@@ -2,25 +2,25 @@
 
 ```
       ▐▛███▜▌
-     ▟██████▙     f e d u p
+     ▟██████▙     f e d u p  v3.0
     ▐████████▌    ─────────────────────────────
-     ▜██████▛     Fedora Update Utility · KDE Edition
+     ▜██████▛     Fedora Update Utility
       ▘▘ ▝▝
 ```
 
-**The everything-updater for Fedora.** A single-file bash TUI that unifies every update path on a Fedora system — dnf, Flatpak, Snap, device firmware, and containers — with pre-update Btrfs snapshots, per-package selection, security-only mode, scheduled checks, and remote multi-host support.
+**The everything-updater for Fedora.** A single-file bash TUI that unifies every update path on a Fedora system — dnf, Flatpak, Snap, firmware, containers, and optional user-space tools — with pre-update Btrfs snapshots, safety gates, offline upgrades, and remote multi-host support.
 
-Built for Fedora 44 KDE. Zero dependencies beyond a stock install — anything optional (snapper, versionlock plugin, snapd…) is detected at runtime and offered for installation when you first use the feature.
+Built for Fedora. Zero dependencies beyond a stock install — anything optional (snapper, versionlock plugin, snapd, whiptail…) is detected at runtime and offered when you use the feature.
 
 ## Why
 
-Fedora spreads updates across half a dozen tools: `dnf` for packages, `flatpak` for Flathub apps, `snap` if you use it, `fwupdmgr` for BIOS/SSD/dock firmware, `distrobox`/`toolbox` for containers, plus snapper for safety snapshots and dnf plugins for holds and security filtering. fedup wraps all of it in one keyboard-driven menu — and one `--all` flag for when you don't want a menu at all.
+Fedora spreads updates across half a dozen tools: `dnf` for packages, `flatpak` for Flathub apps, `snap` if you use it, `fwupdmgr` for BIOS/SSD/dock firmware, `distrobox`/`toolbox` for containers, plus cargo/pipx/npm/brew for user tooling. fedup wraps all of it in one keyboard-driven menu — and one `--all` flag for when you don't want a menu at all.
 
 ## Install
 
 ```bash
-git clone git@github.com:TonyAldo/Fedup.git
-cd Fedup
+git clone git@github.com:TonyAldo/fedup.git
+cd fedup
 chmod +x fedup.sh
 ./fedup.sh
 ```
@@ -29,108 +29,125 @@ Optionally put it on your PATH:
 
 ```bash
 cp fedup.sh ~/.local/bin/fedup
+fedup --install-completion   # bash + zsh
 ```
-
-(The built-in timer installer does this for you — see [Automation](#automation).)
 
 ## Usage
 
 ```
-fedup                     interactive menu
-fedup --all               update everything, no menu
-fedup --security          apply security updates only
-fedup --check             count pending updates (exit 0 = none, 10 = some)
-fedup --check --notify    same, plus a desktop notification
-fedup --check --json      machine-readable counts
-fedup --dry-run <mode>    preview any of the above without changing anything
-fedup --remote h1 h2      run --all on remote hosts over SSH
-fedup --remote-check h1   run --check on remote hosts (--json = JSON array)
-fedup --help              usage summary
+fedup                          interactive menu
+fedup --all                    update everything, no menu
+fedup --security               apply security updates only
+fedup --check                  count pending updates (exit 0 = none, 10 = some)
+fedup --check --notify         same, plus a desktop notification
+fedup --check --json           machine-readable counts
+fedup --dry-run <mode>         preview any of the above without changing anything
+fedup --offline                download full upgrade for apply-at-reboot
+fedup --remote h1 h2           run --all on remote hosts over SSH
+fedup --remote-check h1        run --check on remote hosts (--json = JSON array)
+fedup --doctor                 free space, power, size estimate, pending counts
+fedup --self-update            pull latest fedup.sh (git or URL)
+fedup --install-completion     install bash/zsh completions
+fedup --whiptail               force whiptail/dialog UI (or set USE_WHIPTAIL=true)
+fedup --help                   usage summary
 ```
 
 ## Features
 
 ### 🎯 Pick your updates
-An interactive checklist built from `dnf check-update`: arrow keys to move, **space** to toggle, **a**/**n** for all/none of the visible list, **/** to filter by name substring, **c** to read a package's changelog or advisory before committing, **p** to pin the package via versionlock so it stops appearing in future update sets.
+Interactive checklist from `dnf check-update`: arrows / **mouse click**, **space** to toggle, **a**/**n**, **/** filter, **c** changelog, **p** versionlock pin. Flatpak has the same pick-and-choose flow.
 
-### 🛡️ Security-only updates
-Shows the advisory severity summary and per-CVE list, then applies only `dnf upgrade --security`. Also available non-interactively as `fedup --security`.
+### 🛡️ Security-only & offline upgrades
+- Security: advisory summary + `dnf upgrade --security`
+- Offline: download now, apply at reboot via `dnf offline`
 
-### 📸 Snapshots before every update
-On Btrfs roots, every update action takes a snapshot first. Prefers **snapper** (with linked pre/post snapshot pairs, so `snapper status` shows exactly what a transaction changed); offers to install and configure it if missing; falls back to a raw read-only `btrfs subvolume snapshot`. Skips gracefully on non-Btrfs filesystems.
+### 📸 Snapshots & rollback
+Btrfs pre/post snapshots via snapper (or raw RO snapshot). Menu rollback wizard wraps `snapper rollback`.
 
-### 🔌 Firmware, containers, codecs
-- **fwupd/LVFS**: refresh metadata, list pending BIOS/SSD/dock/peripheral firmware, stage for next reboot.
-- **distrobox / toolbox**: upgrade all containers.
-- **RPM Fusion**: enable free+nonfree keyed to your release, swap in full ffmpeg, update the multimedia group, and auto-detect Intel/AMD GPUs for the correct VA-API driver swap.
+### 🔌 Firmware, containers, groups, codecs
+- **fwupd/LVFS**, **distrobox / toolbox**, **dnf group upgrade**, **dnf modules**
+- **RPM Fusion** codecs + Intel/AMD VA-API helpers
+
+### 🧰 User-space (opt-in)
+cargo-update, pipx, npm -g, Homebrew, AppImages (`appimageupdatetool`). Off by default (`SKIP_USERSPACE=true`).
+
+### 🧹 Kernel cleanup
+List kernels, keep N newest (+ always the running one), remove the rest.
 
 ### ♻️ Avoid unnecessary reboots
-`dnf needs-restarting --services` lists services running against updated libraries and restarts them in place. Tells you honestly when a kernel/core-library change means a real reboot is needed.
+`dnf needs-restarting` for reboot hint + in-place service restarts.
 
-### 🌐 Mirror & download tuning
-Enables `fastest_mirror` and `max_parallel_downloads=10` in `/etc/dnf/dnf.conf` and rebuilds the metadata cache.
+### 🛡️ Safety gates
+Before big upgrades:
+- **Disk preflight** — require `MIN_FREE_GB` free on `/` and `/var`
+- **Battery gate** — optional `REQUIRE_AC=true`
+- **Exclude globs** — `EXCLUDE=kernel*,akmod*` (picker + dnf)
+- **Size estimate** — download size + rough ETA
 
-### 🩺 COPR health check
-Probes every enabled COPR's `repomd.xml` for your current `$releasever` and offers to disable dead repos — the most common cause of dnf errors after a Fedora version bump.
+### 🔍 UX extras
+- Unified search across dnf / flatpak / snap / firmware
+- History reports + **diff/summary of last run**
+- Mouse support in menus; optional **whiptail/dialog** backend
+- Shell completions (bash/zsh)
+- **Self-update** from git or GitHub raw URL
 
-### 📜 History reports
-Every update action writes a report to `~/.local/share/fedup/history/` including the full dnf transaction. View and prune old reports (keep 10 newest / delete >30 days / wipe) from the menu.
-
-### ▷ Dry-run mode
-`--dry-run` previews anything. dnf operations show the *real* resolved transaction via `--assumeno`; everything else narrates what would run without executing.
+### 🌐 Mirrors, COPR, timers, remote
+Mirror tuning, COPR health check, daily notify timer, weekly `--all` timer, SSH multi-host mode.
 
 ### ⬢ Atomic-aware
-Detects image-based Fedora (Kinoite, Silverblue, bootc) via `/run/ostree-booted`, guards all dnf-mutating features from doing damage, and routes base-image updates through `rpm-ostree upgrade` instead. Flatpak, firmware, and container updates work as normal.
+Detects image-based Fedora, guards dnf mutations, uses `rpm-ostree upgrade` for the base image.
 
 ## Configuration
 
-`~/.config/fedup/config` — created with a commented template via the menu (⚙️ Edit fedup configuration). Parsed as whitelisted key=value data, never executed.
+`~/.config/fedup/config` — created from the menu. Parsed as whitelisted data, never executed.
 
 ```ini
-ALWAYS_SNAPSHOT=false   # snapshot without asking (raw btrfs fallback too)
-SKIP_FLATPAK=false      # skip flatpak in 'update everything' & counts
+ALWAYS_SNAPSHOT=false
+SKIP_FLATPAK=false
 SKIP_SNAP=false
 SKIP_FIRMWARE=false
 SKIP_CONTAINERS=false
-AUTOREMOVE=true         # dnf autoremove at end of 'update everything'
+SKIP_USERSPACE=true       # cargo/pipx/npm/brew/AppImage
+AUTOREMOVE=true
+REQUIRE_AC=false
+MIN_FREE_GB=2
+KERNEL_KEEP=2
+USE_WHIPTAIL=false
+# EXCLUDE=kernel*,akmod*
+# APPIMAGE_DIRS=~/Applications:~/.local/bin
+# SELF_UPDATE_URL=https://raw.githubusercontent.com/TonyAldo/fedup/main/fedup.sh
 ```
 
 ## Automation
 
-The menu's timer installer sets up either or both:
-
-- **Daily check (user timer)** — runs `fedup --check --notify`; you get a Plasma notification when updates are pending. Copies the script to `~/.local/bin/fedup`.
-- **Weekly auto-update (system timer)** — runs `fedup --all` unattended, Sundays ~4 AM. Copies the script to `/usr/local/bin/fedup`.
+- **Daily check (user timer)** — `fedup --check --notify`
+- **Weekly auto-update (system timer)** — `fedup --all` Sundays ~4 AM
 
 ```bash
-systemctl --user list-timers fedup-check.timer     # inspect
-sudo systemctl disable --now fedup-auto.timer      # opt out
+systemctl --user list-timers fedup-check.timer
+sudo systemctl disable --now fedup-auto.timer
 ```
 
-`--check` exits **0** when clean and **10** when updates are pending, so it composes cleanly with scripts and monitoring.
+`--check` exits **0** when clean and **10** when updates are pending.
 
 ## Remote mode
 
 ```bash
-fedup --remote homelab1 homelab2          # full update on each host over SSH
-fedup --remote-check homelab1 --json      # aggregate JSON array of pending counts
+fedup --remote homelab1 homelab2
+fedup --remote-check homelab1 --json
 ```
 
-Requires SSH key auth to each host. `--json` output is a valid JSON array with per-host `ok`/`error` fields; exit code is non-zero if any host failed — cron- and dashboard-friendly.
-
-```json
-[{"host":"homelab1","dnf":12,"security":3,"flatpak":2,"snap":0,"firmware":1,"total":15,"reboot_needed":false}]
-```
+Requires SSH key auth. Remote copy is cleaned up after the run.
 
 ## Requirements
 
-- Fedora Workstation/KDE (developed against Fedora 44, dnf5)
-- bash 4+, plus base-system tools (dnf, sudo, curl, findmnt, systemctl — all preinstalled)
-- Optional, offered on demand: `snapper`, `dnf5-plugins` (versionlock/changelog/needs-restarting), `snapd`, `fwupd`, `distrobox`
+- Fedora (developed against Fedora 44 / dnf5)
+- bash 4+, stock tools (dnf, sudo, curl, findmnt, systemctl)
+- Optional: snapper, dnf5-plugins, snapd, fwupd, distrobox, whiptail, cargo-update, appimageupdatetool
 
 ## Disclaimer
 
-fedup runs privileged package transactions. Read the script before running it — it's one file and commented for exactly that reason. Test destructive-adjacent features (snapshots, auto-update timers) with `--dry-run` first. No warranty; see [LICENSE](LICENSE).
+fedup runs privileged package transactions. Read the script before running it. Prefer `--dry-run` first for destructive-adjacent features (snapshots, rollback, offline reboot, auto timers). No warranty; see [LICENSE](LICENSE).
 
 ## License
 

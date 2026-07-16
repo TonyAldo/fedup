@@ -1,0 +1,21 @@
+#compdef fedup fedup.sh
+# zsh completion for fedup — install via: fedup --install-completion
+# or: cp completions/_fedup ~/.zfunc/_fedup && fpath+=(~/.zfunc)
+
+_arguments -s -S \
+  '--all[Update everything]' \
+  '--security[Security updates only]' \
+  '--check[Count pending updates]' \
+  '--notify[Desktop notification with --check]' \
+  '--json[JSON output]' \
+  '--dry-run[Preview without changing]' \
+  '--remote[Run --all on remote hosts]:host:_hosts' \
+  '--remote-check[Run --check on remote hosts]:host:_hosts' \
+  '--offline[Download offline upgrade]' \
+  '--self-update[Update fedup itself]' \
+  '--install-completion[Install shell completions]' \
+  '--doctor[Quick health / pending summary]' \
+  '--whiptail[Use whiptail/dialog menus]' \
+  '--version[Show version]' \
+  '--help[Show help]' \
+  '*:host:_hosts'
