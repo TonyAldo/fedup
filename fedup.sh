@@ -714,7 +714,7 @@ do_security() {
         dnf upgrade --security --assumeno "${_ex[@]}"
         return 0
     fi
-    if confirm "Apply security updates only ($n advisories)?"; then
+    if confirm "Apply security updates only ($n package update(s))?"; then
         safety_gates || return 1
         log_start "security-updates"
         snapshot_pre_update
@@ -727,6 +727,20 @@ do_security() {
 
 # ────────────── DNF updates + interactive picker (v2) ─────────────────
 declare -a PKG_NAME PKG_VER PKG_REPO PKG_SEL
+
+# Normalize `dnf check-update` output on stdin to "name version repo" triples.
+# dnf wraps long package names onto their own line (version+repo follow on the
+# next), and the Obsoleting Packages section repeats 3-field lines that are not
+# pending upgrades — join the former, drop the latter.
+parse_check_update() {
+    awk '
+        /^Obsoleting/       { skip=1 }
+        skip                { next }
+        NF==3               { print; pend=""; next }
+        NF==1               { pend=$1; next }
+        NF==2 && pend != "" { print pend, $1, $2; pend="" }
+    '
+}
 
 fetch_updates() {
     PKG_NAME=(); PKG_VER=(); PKG_REPO=(); PKG_SEL=()
@@ -745,14 +759,14 @@ fetch_updates() {
     if (( rc == 0 )); then return 1; fi
     if (( rc != 100 )); then fail "dnf check-update failed (rc=$rc)"; return 2; fi
     while read -r name ver repo; do
-        [[ -z "$name" || "$name" == Obsoleting* ]] && continue
+        [[ -z "$name" ]] && continue
         # Strip arch for exclude matching (kernel.x86_64 → kernel)
         local bare="${name%.*}"
         if pkg_excluded "$name" || pkg_excluded "$bare"; then
             continue
         fi
         PKG_NAME+=("$name"); PKG_VER+=("$ver"); PKG_REPO+=("$repo"); PKG_SEL+=(1)
-    done < <(printf '%s\n' "$out" | awk 'NF==3')
+    done < <(printf '%s\n' "$out" | parse_check_update)
     (( ${#PKG_NAME[@]} > 0 ))
 }
 
@@ -883,7 +897,7 @@ pick_packages() {
             c)        (( ci >= 0 )) && { mouse_off; show_changelog "${PKG_NAME[ci]}"; tput civis 2>/dev/null; mouse_on; };;
             p)        if (( ci >= 0 )); then
                           tput cnorm; mouse_off
-                          if ensure_versionlock; then
+                          if need_sudo && ensure_versionlock; then
                               sudo dnf versionlock add "${PKG_NAME[ci]}" &>/dev/null \
                                   && PKG_SEL[ci]=0 \
                                   && PKG_REPO[ci]="⚲ held"
@@ -1295,7 +1309,7 @@ count_updates() {  # sets CNT_DNF CNT_SEC CNT_FLATPAK CNT_SNAP CNT_FW REBOOT CNT
         out=$(dnf -q check-update --refresh 2>/dev/null) || rc=$?
     fi
     if (( rc == 100 )); then
-        CNT_DNF=$(_count_trim "$(printf '%s\n' "$out" | awk 'NF==3' | grep -vc '^Obsoleting' || true)")
+        CNT_DNF=$(_count_trim "$(printf '%s\n' "$out" | parse_check_update | wc -l)")
     fi
 
     # Security advisories (usually quick after the refresh above)
@@ -1436,6 +1450,8 @@ EOF
         good "Daily check timer active:  systemctl --user list-timers fedup-check.timer"
     fi
     echo
+    warn "Unattended runs answer every prompt with 'no' — pre-update snapshots are"
+    warn "skipped unless ALWAYS_SNAPSHOT=true is set in $CONFIG_FILE."
     if confirm "Install WEEKLY system auto-update timer (runs as root, unattended)?"; then
         need_sudo || return
         sudo cp -f "$(readlink -f "$0")" /usr/local/bin/fedup && sudo chmod +x /usr/local/bin/fedup
@@ -1933,13 +1949,13 @@ do_unified_search() {
     fi
     info "── dnf ──"
     while read -r name ver repo; do
-        [[ -z "$name" || "$name" == Obsoleting* ]] && continue
+        [[ -z "$name" ]] && continue
         pkg_excluded "$name" && continue
         if [[ -z "$filter" || "${name,,}" == *"$filter"* ]]; then
             printf "       ${FG_CYAN}dnf${RESET}  %-42s %s\n" "$name" "$ver"
             (( hits++ )) || true
         fi
-    done < <(printf '%s\n' "$out" | awk 'NF==3')
+    done < <(printf '%s\n' "$out" | parse_check_update)
 
     # ── flatpak ──
     if ! $SKIP_FLATPAK && command -v flatpak &>/dev/null; then
@@ -2243,7 +2259,9 @@ write_default_config() {
     cat > "$CONFIG_FILE" <<'EOF'
 # fedup configuration — parsed as data, never executed.
 
-# Take snapshots automatically without asking (uses raw btrfs if snapper absent)
+# Take snapshots automatically without asking (uses raw btrfs if snapper absent).
+# Required for snapshots in unattended runs (fedup-auto.timer), where every
+# confirmation prompt defaults to 'no'.
 ALWAYS_SNAPSHOT=false
 
 # Skip sources during 'update everything' and update counts
